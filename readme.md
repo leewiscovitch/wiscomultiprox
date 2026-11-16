@@ -283,8 +283,10 @@ the same with a blank disk.
 
 Also done: the built ISO written to a real USB stick with the `dd` above, and `cmp` says it matches.
 
-**Not tested:** booting the stick on real hardware (the timeout falling through to the disk included: see
-"Checking the timeout on real hardware"); legacy BIOS boot; Secure Boot on; products other than Proxmox VE.
+**On real hardware:** the timeout's hand-over to the disk did **not** work on the first try, on an HP laptop
+with Ubuntu (2026-11-15; cause not found yet). Nothing was installed.
+
+**Not tested:** the install entries on real hardware; legacy BIOS boot; Secure Boot on; products other than Proxmox VE.
 
 ### Checking the timeout on real hardware
 
