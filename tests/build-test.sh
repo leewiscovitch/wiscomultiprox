@@ -123,6 +123,12 @@ cp "$repo/examples/first-boot.sh" "$tmp/fb.sh"
 check "--out equal to --first-boot" 2 "first-boot" -- \
   "$build" --iso "$iso" --nodes "$(fresh)" --out "$tmp/fb.sh" --first-boot "$tmp/fb.sh"
 
+for t in 5 9 3601 abc 1.5 -1 ""; do
+  check "--timeout '$t' is refused" 2 "timeout" -- "$build" --iso "$iso" --nodes "$(fresh)" --out "$out" --timeout "$t"
+done
+check "--timeout without a value" 2 "timeout needs a value" -- \
+  "$build" --iso "$iso" --nodes "$(fresh)" --out "$out" --timeout
+
 check "--out a folder name ending in /" 2 "--out" -- "$build" --iso "$iso" --nodes "$(fresh)" --out "$tmp/nosuch/"
 
 # An ISO whose automated block holds one more entry: the build must not drop it silently.
@@ -199,8 +205,52 @@ check "build: /auto-installer-mode.toml is partition mode, label proxmox-ais" 0 
 first_entry() { grep -n '^menuentry ' "$1" | head -n 1 | cut -d: -f1; }
 entries_before() { head -n "$(($2 - 1))" "$1" | grep -c '^menuentry ' || true; }
 
+# The timeout block before the first entry: <timeout on UEFI> <default on UEFI>, then BIOS: none, Graphical.
+timeout_block_ok() { # <grub.cfg> <seconds>
+  local g="$1" first want
+  first=$(first_entry "$g")
+  want=$(printf '%s\n' 'set timeout-style=menu' 'if [ "${grub_platform}" = "efi" ]; then' \
+    "    set timeout=$2" '    set default=multiprox-next' 'else' '    set timeout=-1' \
+    '    set default=multiprox-graphical' 'fi')
+  [ "$(head -n "$first" "$g" | grep -vE '^\s*(#|$)' | grep -A7 -xF 'set timeout-style=menu')" = "$want" ] \
+    || { echo "timeout block before the first entry:"; head -n "$first" "$g" | tail -n 20; return 1; }
+}
+# Whatever the timeout starts is safe: the only defaults are the leave-the-stick and the Graphical entries, no
+# fallback, the only timeout >= 0 in the file is ours, and the leave-the-stick entry does nothing but `exit`.
+timeout_safe() { # <grub.cfg> <seconds>
+  local g="$1" next
+  [ "$(grep -E '^\s*set default=' "$g" | sed -E 's/^\s*set default=//' | sort -u | tr '\n' ' ')" \
+    = "multiprox-graphical multiprox-next " ] || { echo "defaults: $(grep 'set default=' "$g")"; return 1; }
+  ! grep -qE '^\s*set fallback' "$g" || { echo "a fallback is set"; return 1; }
+  [ "$(grep -E '^\s*set timeout=[0-9]' "$g")" = "    set timeout=$2" ] \
+    || { echo "timeouts: $(grep -E 'set timeout=' "$g")"; return 1; }
+  leave_entry_ok "$g" || return 1
+  grub-script-check "$g" || { echo "grub-script-check fails"; return 1; }
+}
+
+# The leave-the-stick entry: UEFI only; chainloads a disk's boot loader, never the stick's; no kernel, initrd or
+# other config; ends with `exit` (back to the firmware) when no disk has a loader.
+leave_entry_ok() { # <grub.cfg>
+  local g="$1" body
+  grep -B1 -F -- "--id multiprox-next {" "$g" | head -n 1 | grep -qxF 'if [ "${grub_platform}" = "efi" ]; then' \
+    || { echo "the leave-the-stick entry is not inside the UEFI check"; return 1; }
+  grep -qF -- "    menuentry 'Leave the stick: boot from the local disk' --id multiprox-next {" "$g" \
+    || { echo "the leave-the-stick title"; return 1; }
+  body=$(sed -n '/--id multiprox-next {$/,/^    }$/p' "$g")
+  grep -qF 'regexp --set=1:multiprox_stick' <<<"$body" || { echo "no stick disk from \$root"; return 1; }
+  grep -qF 'if [ "hd$d" != "$multiprox_stick" -a ! -e "(hd$d)/.pve-cd-id.txt" ]; then' <<<"$body" \
+    || { echo "the stick is not skipped"; return 1; }
+  grep -qF 'for f in /EFI/BOOT/BOOTX64.EFI /EFI/systemd/systemd-bootx64.efi /EFI/proxmox/grubx64.efi; do' <<<"$body" \
+    || { echo "the loader paths"; return 1; }
+  # chainloader takes the loader's device from $root, so root is set to the disk's partition right before it.
+  grep -A1 -xF '                                set root="hd$d,$t$p"' <<<"$body" \
+    | grep -qxF '                                chainloader "$f"' || { echo "no set root + chainloader"; return 1; }
+  ! grep -qE '^\s*(linux|initrd|configfile|source|normal)\b' <<<"$body" || { echo "loads something else"; return 1; }
+  [ "$(grep -v '^\s*}$' <<<"$body" | tail -n 1)" = "        exit" ] || { echo "does not end in exit"; return 1; }
+}
+
 grub_ok() {
-  local g="$x/grub.cfg" lines first graphical
+  local g="$x/grub.cfg" lines first graphical next
   lines=$(grep 'proxmox-multiprox-node=' "$g")
   [ "$(wc -l <<<"$lines")" = 2 ] || { echo "node option lines: $lines"; return 1; }
   grep -q 'proxmox-multiprox-node=node1$' <<<"$lines" && grep -q 'proxmox-multiprox-node=node2$' <<<"$lines" \
@@ -215,17 +265,19 @@ grub_ok() {
   grep -qF "menuentry 'Automated Install: node1' --id multiprox-node1 " "$g" \
     || { echo "no --id on node1's entry"; return 1; }
   first=$(first_entry "$g")
-  head -n "$first" "$g" | grep -qx '\s*set timeout=-1' || { echo "no set timeout=-1 before the entries"; return 1; }
-  ! head -n "$first" "$g" | grep -qE '^\s*set timeout=[0-9]' || { echo "a timeout >= 0 before the entries"; return 1; }
+  # The leave-the-stick entry is the first one in the menu, before the node entries.
+  next=$(grep -n -F -- "--id multiprox-next {" "$g" | cut -d: -f1)
+  [ -n "$next" ] && [ "$next" -lt "$(grep -n -F -- "--id multiprox-node1 " "$g" | cut -d: -f1)" ] \
+    || { echo "the leave-the-stick entry is not before the node entries"; return 1; }
+  timeout_block_ok "$g" 90 || return 1
+  timeout_safe "$g" 90 || return 1
   graphical=$(grep -n "^menuentry 'Install Proxmox VE (Graphical)' --id multiprox-graphical " "$g" | cut -d: -f1)
   [ -n "$graphical" ] || { echo "no --id on the Graphical entry"; return 1; }
-  head -n "$first" "$g" | grep -qx '\s*set default=multiprox-graphical' \
-    || { echo "set default is not the Graphical entry"; return 1; }
   ! head -n "$graphical" "$g" | grep -qF '(Automated)' || { echo "the stock Automated entry is still there"; return 1; }
   grep -qF "menuentry 'Install Proxmox VE (Terminal UI)'" "$g" && grep -qF "menuentry 'Rescue Boot'" "$g" \
     || { echo "stock entries missing"; return 1; }
 }
-check "build: grub.cfg has the node entries, no timeout, Graphical default" 0 "" -- grub_ok
+check "build: grub.cfg has the node entries, leave-the-stick after 90 s on UEFI, no timeout on BIOS" 0 "" -- grub_ok
 
 cpio_ok() {
   local c="$x/multiprox.cpio" names want
@@ -250,8 +302,33 @@ img_ok() {
 }
 check "build: node1.img is labelled proxmox-ais and holds node1.toml" 0 "" -- img_ok
 
-check "build: a second run to the same --out overwrites" 0 "build.sh: wrote" -- \
-  "$build" --iso "$iso" --nodes "$tmp/my nodes" --out "$built"
+check "build: a second run to the same --out overwrites (--timeout 120)" 0 "build.sh: wrote" -- \
+  "$build" --iso "$iso" --nodes "$tmp/my nodes" --out "$built" --timeout 120
+
+grub_of() { # <iso> <grub.cfg to write>
+  rm -f "$2"
+  xorriso -osirrox on -indev "$1" -extract /boot/grub/grub.cfg "$2" > /dev/null 2>&1
+}
+timeout120_ok() {
+  local g="$tmp/t120-grub.cfg"
+  grub_of "$built" "$g"
+  timeout_block_ok "$g" 120 && timeout_safe "$g" 120
+}
+check "build: --timeout 120 leaves the stick after 120 s on UEFI" 0 "" -- timeout120_ok
+
+off_ok() {
+  local g="$tmp/off-grub.cfg" first
+  "$build" --iso "$iso" --nodes "$tmp/my nodes" --out "$built" --timeout off > /dev/null 2>&1 || return 1
+  grub_of "$built" "$g"
+  first=$(first_entry "$g")
+  head -n "$first" "$g" | grep -qx 'set timeout=-1' || { echo "no set timeout=-1"; return 1; }
+  head -n "$first" "$g" | grep -qx 'set default=multiprox-graphical' || { echo "default not Graphical"; return 1; }
+  ! grep -qE '^\s*set timeout=[0-9]' "$g" || { echo "a timeout >= 0"; return 1; }
+  ! grep -qE '^\s*set default=multiprox-next' "$g" || { echo "leave-the-stick is a default"; return 1; }
+  grep -qF -- "--id multiprox-next {" "$g" || { echo "the leave-the-stick entry is missing"; return 1; }
+  grub-script-check "$g"
+}
+check "build: --timeout off waits for ever, Graphical default" 0 "" -- off_ok
 
 auto="$tmp/auto.iso"
 auto_ok() {

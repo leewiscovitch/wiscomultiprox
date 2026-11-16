@@ -5,7 +5,8 @@
 set -euo pipefail
 export LC_ALL=C
 
-usage="usage: build.sh --iso <stock proxmox-ve ISO> --nodes <folder> --out <file.iso> [--first-boot <script>]"
+usage="usage: build.sh --iso <stock proxmox-ve ISO> --nodes <folder> --out <file.iso> [--first-boot <script>]
+       [--timeout <seconds 10-3600, or off; default 90>]"
 
 # Exit codes: 2 usage or a missing input, 3 a missing tool, 4 a bad nodes folder,
 # 5 the ISO is not what the method relies on, 1 a tool that failed.
@@ -25,23 +26,31 @@ note() {
 
 # ---- arguments
 
-iso="" nodes="" out="" first_boot=""
+iso="" nodes="" out="" first_boot="" menu_timeout=90
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) echo "$usage"; exit 0 ;;
-    --iso|--nodes|--out|--first-boot)
+    --iso|--nodes|--out|--first-boot|--timeout)
       [ $# -ge 2 ] || die 2 "$1 needs a value; $usage"
       case "$1" in
         --iso) iso="$2" ;;
         --nodes) nodes="$2" ;;
         --out) out="$2" ;;
         --first-boot) first_boot="$2" ;;
+        --timeout) menu_timeout="$2" ;;
       esac
       shift 2 ;;
     *) die 2 "unknown argument '$1'; $usage" ;;
   esac
 done
 [ -n "$iso" ] && [ -n "$nodes" ] && [ -n "$out" ] || die 2 "$usage"
+# The boot menu's timeout: after it, a UEFI machine leaves the stick for its next boot device (never an install).
+# At least 10 s, so a person has time to press a key; "off" waits for ever, as before.
+if [ "$menu_timeout" != off ]; then
+  [[ "$menu_timeout" =~ ^[0-9]+$ ]] && [ "${#menu_timeout}" -le 4 ] && [ "$menu_timeout" -ge 10 ] \
+    && [ "$menu_timeout" -le 3600 ] || die 2 "--timeout $menu_timeout: give seconds from 10 to 3600, or off"
+  menu_timeout=$((10#$menu_timeout))
+fi
 
 # ---- tools
 
@@ -267,23 +276,72 @@ chmod 0755 "$overlay/etc" "$overlay/multiprox"
 (cd "$overlay" && find . -mindepth 1 | sed 's|^\./||' | sort | cpio -o -H newc -R 0:0 --quiet) \
   > "$work/multiprox.cpio" || die 1 "cpio could not make the overlay"
 
-# The menu: the stock grub.cfg with its automated block replaced by one entry per node. No timeout; the default is
-# the stock Graphical entry, which asks before it does anything.
-# Entries are chosen by --id, not by position.
-timeout=-1
-default=multiprox-graphical
+# The menu: the stock grub.cfg with its automated block replaced by one entry per node, and an entry that leaves
+# the stick. On UEFI that entry is the default after --timeout seconds with no key pressed: it starts the local
+# disk's boot loader (below). Legacy BIOS (not tested) keeps no timeout and the stock Graphical entry as default,
+# which asks before it does anything. A timeout never starts an install entry. Entries are chosen by --id, not by position.
 extra=""
-if [ -n "$autoboot" ]; then
-  timeout=3
-  default="multiprox-$autoboot"
-  extra=" console=tty0 console=ttyS0,115200"
-fi
+if [ -n "$autoboot" ]; then extra=" console=tty0 console=ttyS0,115200"; fi
 {
   head -n "$((auto_lines - 1))" "$work/grub.cfg"
-  echo "# multiprox: one entry per machine; no timeout, the default is the Graphical entry below."
+  echo "# multiprox: one entry per machine, and one that leaves the stick (boots the local disk)."
   echo "set timeout-style=menu"
-  echo "set timeout=$timeout"
-  echo "set default=$default"
+  if [ -n "$autoboot" ]; then
+    echo "# TEST BUILD: starts $autoboot by itself."
+    echo "set timeout=3"
+    echo "set default=multiprox-$autoboot"
+  elif [ "$menu_timeout" = off ]; then
+    echo "# --timeout off: no timeout; the default is the Graphical entry, which asks before it does anything."
+    echo "set timeout=-1"
+    echo "set default=multiprox-graphical"
+  else
+    echo "# UEFI: after $menu_timeout s with no key, leave the stick. Legacy BIOS: no timeout, Graphical default."
+    echo 'if [ "${grub_platform}" = "efi" ]; then'
+    echo "    set timeout=$menu_timeout"
+    echo "    set default=multiprox-next"
+    echo "else"
+    echo "    set timeout=-1"
+    echo "    set default=multiprox-graphical"
+    echo "fi"
+  fi
+  echo
+  # GRUB's `exit` returns EFI_SUCCESS (2.12, also `exit 1`), and on that a UEFI boot manager shows its own menu
+  # instead of moving on to the next BootOrder entry (UEFI spec 3.1.1; seen in OVMF). So the entry chainloads a
+  # disk's boot loader at fixed paths itself, skipping the stick (the disk GRUB booted from, and any disk with
+  # /.pve-cd-id.txt). If no disk has one, `exit`: the firmware's menu, nothing installs.
+  cat <<'GRUB'
+if [ "${grub_platform}" = "efi" ]; then
+    menuentry 'Leave the stick: boot from the local disk' --id multiprox-next {
+        insmod part_gpt
+        insmod part_msdos
+        insmod fat
+        insmod chain
+        insmod regexp
+        set multiprox_stick=
+        regexp --set=1:multiprox_stick '^\(?([a-z]+[0-9]+)' "$root"
+        for d in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            if [ "hd$d" != "$multiprox_stick" -a ! -e "(hd$d)/.pve-cd-id.txt" ]; then
+                for t in gpt msdos; do
+                    for p in 1 2 3 4 5 6 7 8; do
+                        for f in /EFI/BOOT/BOOTX64.EFI /EFI/systemd/systemd-bootx64.efi /EFI/proxmox/grubx64.efi; do
+                            if [ -f "(hd$d,$t$p)$f" ]; then
+                                echo "multiprox: leaving the stick for (hd$d,$t$p)$f"
+                                # chainloader gives the loader $root as its device: set it to the disk's.
+                                set root="hd$d,$t$p"
+                                chainloader "$f"
+                                boot
+                            fi
+                        done
+                    done
+                done
+            fi
+        done
+        echo "multiprox: no other disk has a UEFI boot loader; back to the firmware"
+        sleep 10
+        exit
+    }
+fi
+GRUB
   echo
   for name in "${names[@]}"; do
     echo "menuentry 'Automated Install: $name' --id multiprox-$name --class debian --class gnu-linux --class gnu --class os {"
