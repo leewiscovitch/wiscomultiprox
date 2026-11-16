@@ -44,6 +44,10 @@ The stock ISO is not in the repo: download it once to a path outside the repo an
   work folder is named; titles are `Automated Install: <name>` (the owner; the theme cuts titles at about 60 characters, so names are at most 40); readme prefixes, the fallback command, a `$STICK`
   guard. New `tests/picker-test.sh` (7 cases, the picker in the stock initrd's busybox); build-test 42 cases
 - Next: "After this plan", in `wiscolabx`, a fresh session, model `fable`
+- **2026-11-15, pushed:** public as one commit on the owner's "Initial commit" (the step-by-step history stays
+  local); the repository is managed by `wiscolabx` `tofu/github`. Before the push: build-test 43 passed,
+  picker-test 7 passed, vm-test 6 passed. Not booted on hardware yet: the first hardware boot will be the first
+  real install (a wrong entry first, which must be refused, then the right one)
 
 ## Global Constraints
 
