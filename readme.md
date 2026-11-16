@@ -1,0 +1,271 @@
+# wiscomultiprox
+
+One Proxmox VE install stick for several machines. `build.sh` takes the stock Proxmox VE ISO and a folder with one
+[answer file](https://pve.proxmox.com/wiki/Automated_Installation) per machine, and writes one ISO. Written to a
+USB stick, it boots to a menu with an unattended-install entry per machine, next to Proxmox's own entries:
+
+```
+Automated Install: node1
+Automated Install: node2
+Install Proxmox VE (Graphical)                <- highlighted; the menu waits, it never starts anything by itself
+Install Proxmox VE (Terminal UI)
+...
+Advanced Options
+```
+
+## What it does to a machine
+
+**Picking a machine's entry wipes that machine's disk and installs Proxmox VE on it, without asking.** That is the
+point of an unattended install. Any other machine is refused before a disk is touched:
+
+- the machine's serial number is not the entry's (if you gave one: `<name>.serial`): refused at once, with both
+  serial numbers on the screen
+- the network card or the disk is not the one in the answer file: Proxmox's installer refuses
+  (`filter did not match any device` for the network card, `...any devices` for the disk)
+
+Leaving the stick in a machine is safe in one way: the menu has no timeout and its default is the stock Graphical
+installer, which asks before it does anything. Pull it anyway once the install is done.
+
+## What you need
+
+- A build host: Debian with the Proxmox VE repository, or any Proxmox VE node. The tools:
+  `proxmox-auto-install-assistant`, `xorriso`, `e2fsprogs` (`mke2fs`), `cpio`, `zstd`, `python3` (3.11 or later).
+  No root
+- About twice the ISO's size free beside the output file (3.5 GB for 9.2-1)
+- The stock ISO from <https://www.proxmox.com/en/downloads>, checked against its sha256 there
+- Machines that boot UEFI. Legacy BIOS and Secure Boot are **not tested** (see "Tested")
+
+**The next command installs packages.**
+
+```
+# 🔴 [!! makes changes !!] installs the tools (on a Proxmox VE node most are there already)
+sudo apt install proxmox-auto-install-assistant xorriso e2fsprogs cpio zstd python3
+```
+
+## Gathering a machine's values
+
+Each answer file names its machine's network card and disk exactly. On the machine (an installed Proxmox VE, or
+any Linux live system):
+
+```
+# 🟢 [read-only] on Proxmox VE: what the installer sees
+proxmox-auto-install-assistant device-info -t network    # the card's ID_NET_NAME_MAC, e.g. enx525400123456
+proxmox-auto-install-assistant device-info -t disk       # the disk's ID_SERIAL
+# 🟢 [read-only] on any Linux: the same values
+ip -br link                                              # MAC 52:54:00:12:34:56 -> enx525400123456
+udevadm info --query=property /dev/nvme0n1 | grep '^ID_SERIAL='
+# 🟢 [read-only] the machine's serial number, for <name>.serial
+sudo cat /sys/class/dmi/id/product_serial
+```
+
+## The nodes folder
+
+One `<name>.toml` per machine; the name (lowercase letters, digits, `-`, at most 40) becomes the menu entry. Start from
+`examples/` (made-up values) and keep your folder **outside** this repository, or as `nodes/` (ignored by git).
+
+- `<name>.toml`: an ordinary Proxmox answer file. It must have `filter.ID_NET_NAME_MAC` under `[network]` and
+  `filter.ID_SERIAL` under `[disk-setup]`, each the exact value (no `*`, `?`, `[`: a pattern could match another
+  machine), and no other filter or `disk-list` (another key, such as `ID_MODEL = "Samsung*"`, could match another
+  machine too). For `--first-boot`, add `[first-boot]` with `source = "from-iso"`
+- `<name>.serial` (optional, recommended): one line, the machine's serial number, as plain ASCII text. Blanks
+  and Windows line ends are trimmed; a BOM or UTF-16 (what PowerShell 5.1's `>` writes) is refused. So is a placeholder
+  such as `To Be Filled By O.E.M.` or `Default string` (the same on many machines: delete the file instead) Without it, the installer's own filters are the only guard (they hold: see "Tested", test 4)
+- Anything else in the folder is ignored, and named in a note; except near misses such as `node1.serial.txt` or
+  `node1.SERIAL`, which are refused (they would silently drop a check)
+
+**The next commands create a folder and copy files into it.**
+
+```
+# 🔴 [!! makes changes !!] a nodes folder from the examples, outside the repository
+mkdir -p ~/multiprox-nodes
+cp examples/node1.toml examples/node1.serial ~/multiprox-nodes/
+# then edit ~/multiprox-nodes/node1.toml: fqdn, network, filters, root-password-hashed, root-ssh-keys
+```
+
+```
+# 🟢 [read-only] prints a password hash for root-password-hashed (asks for the password)
+openssl passwd -6
+```
+
+## Build
+
+```
+# 🟢 [read-only] the options
+./build.sh --help
+```
+
+**The next command writes (or overwrites) the output ISO.** Its checks run first; any error stops it before
+anything is written.
+
+```
+# 🔴 [!! makes changes !!] writes (or overwrites) the output ISO
+./build.sh --iso proxmox-ve_9.2-1.iso --nodes ~/multiprox-nodes --out multiprox.iso --first-boot examples/first-boot.sh
+```
+
+It ends with `build.sh: wrote multiprox.iso` and `build.sh: sha256 <hash>`. Every error is one line starting
+`build.sh:`, and nothing is left at `--out`. Exit codes: `2` usage or a missing input, `3` a missing tool, `4` a bad
+nodes folder, `5` the ISO is not what the method relies on (a new release: see below), `1` a tool failed.
+`--out` may not be inside the nodes folder (the tool never writes there). A build that was killed leaves a
+`.multiprox-build.*` folder beside `--out`; the next build names it, and you delete it. `--first-boot` is optional: a script (at most 1 MiB) the installed machine runs once at its first boot.
+
+The variable `MULTIPROX_TEST_AUTOBOOT=<name>` is for `tests/vm-test.sh` only: it makes an ISO that **starts that
+machine's install by itself after 3 seconds**. Never write such an ISO to a stick. The build says `TEST BUILD`
+when it is set.
+
+## Writing the stick
+
+Name the stick by `/dev/disk/by-id/`, never by `/dev/sdX` (those letters change), and check it right before writing.
+
+```
+# 🟢 [read-only] plug the stick in, then find it: the usb-... line without -partN
+ls -l /dev/disk/by-id/ | grep usb
+```
+
+```
+# 🟢 [read-only] put YOUR stick's id here, then check it is the stick (size, model) and not mounted
+STICK=/dev/disk/by-id/usb-REPLACE-WITH-YOUR-STICK
+lsblk -o NAME,SIZE,TRAN,MODEL,MOUNTPOINTS "$STICK"
+```
+
+`$STICK` must be set in the same shell as the `dd` below; if it is not (a new terminal), `dd` does nothing.
+
+If a partition of it shows a mount point, unmount it. **The next command unmounts a file system.**
+
+```
+# 🔴 [!! makes changes !!] unmounts one partition of the stick (repeat for each mount point lsblk showed)
+sudo umount /media/REPLACE-WITH-THE-MOUNT-POINT
+```
+
+**The next command erases everything on `$STICK`. Check the `lsblk` output above first.**
+
+```
+# 🔴 [!! DESTRUCTIVE !!] writes the ISO over the whole stick
+[ -b "$STICK" ] && sudo dd if=multiprox.iso of="$STICK" bs=4M conv=fsync oflag=direct status=progress
+```
+
+```
+# 🟢 [read-only] the stick holds the ISO, byte for byte
+sudo cmp -n "$(stat -c %s multiprox.iso)" multiprox.iso "$STICK" && echo "the stick matches"
+```
+
+## Installing
+
+1. A first check with a new stick: boot it on a machine that is **not** in it and pick any machine's entry. It
+   must refuse (serial number), or the installer must stop at `filter did not match any device(s)`. Switch that
+   machine off. This relies on the very guards it checks, and booting on real hardware is not tested yet (see
+   "Tested"): **use a machine whose disks hold nothing that matters**
+2. On the machine: boot from the stick (UEFI boot menu, often F12), pick its entry
+3. The install runs by itself (a few minutes) and reboots. Pull the stick at the reboot
+
+If the machine is refused, the screen says why. Nothing was written; switch it off (hold the power button).
+
+## A new Proxmox VE release
+
+**The next command downloads the new stock ISO.**
+
+```
+# 🔴 [!! makes changes !!] download the new stock ISO
+curl -fLO https://enterprise.proxmox.com/iso/proxmox-ve_<version>.iso
+```
+
+```
+# 🟢 [read-only] compare with the sha256 on the downloads page; stop if it differs
+sha256sum proxmox-ve_<version>.iso
+```
+
+**The next commands write an ISO, and temporary files for the VM test.**
+
+```
+# 🔴 [!! makes changes !!] build from the new release
+./build.sh --iso proxmox-ve_<version>.iso --nodes ~/multiprox-nodes --out multiprox.iso
+# 🔴 [!! makes changes !!] the VM test against the new release (temp files, removed at the end)
+MULTIPROX_TEST_ISO=proxmox-ve_<version>.iso tests/vm-test.sh
+```
+
+If the build stops with exit `5`, or a VM test fails, the release changed something the method relies on (below).
+The fallback is Proxmox's own ISO for one machine. **The next command writes an ISO.**
+
+```
+# 🔴 [!! makes changes !!] a one-machine ISO with the answer file inside (Proxmox's own method)
+proxmox-auto-install-assistant prepare-iso proxmox-ve_<version>.iso --fetch-from iso --answer-file ~/multiprox-nodes/<name>.toml
+```
+
+## How it works
+
+The build:
+
+1. Checks the tools, the nodes folder (names, `validate-answer`, exact filters, no two machines with the same MAC,
+   disk serial or serial number) and the stock ISO
+2. Makes, per machine, a 1 MiB ext2 image labelled `proxmox-ais` holding its `answer.toml`
+3. Packs an overlay (cpio): `/etc/mdev.conf` (one line), `/multiprox/picker`, the images and the serials
+4. Replaces the stock menu's "Automated" block with one entry per machine; each loads Proxmox's own initrd and the
+   overlay after it, with the kernel option `proxmox-multiprox-node=<name>`
+5. Adds the menu and the overlay to a copy of the ISO (`xorriso -dev <copy> -boot_image any keep -map ...`), then
+   runs `proxmox-auto-install-assistant prepare-iso <copy> --fetch-from partition` on it. This order matters:
+   `prepare-iso` first fails ("Overlapping MBR partition entries"), and `-boot_image any replay` to a new file
+   fails ("GPT partitions 1 and 2 overlap")
+
+At boot: the kernel unpacks Proxmox's initrd and the overlay into one tree (the overlay only adds files).
+Proxmox's `/init` runs busybox `mdev -s`, which reads the overlay's `/etc/mdev.conf` and runs the picker once. The
+picker reads the machine's name from the kernel command line, compares the serial number if the stick has one, and
+attaches that machine's image read-only to a loop device. The installer, in partition mode, finds the label
+`proxmox-ais` on it and installs with that answer file and its filters. Nothing is written to the stick.
+
+The option is called `proxmox-...` on purpose: the installer copies unknown boot options into the installed
+system's kernel command line, except those matching `proxmox-*`.
+
+### What it relies on
+
+| Relied on | Checked |
+|---|---|
+| The initrd's `/init` runs `mdev -s`; the initrd has no `/etc/mdev.conf`; its busybox has `losetup` | by the build (exit 5) |
+| `grub.cfg` has the block `if [ -f auto-installer-mode.toml ]; then` (holding only the Automated entry), then the Graphical entry, each once | by the build (exit 5) |
+| The installer finds an answer on a loop device by label, and drops `proxmox-*` options | by the VM test |
+| `validate-answer` and `prepare-iso` print `Error` on failure (both exit 0 even then, in 9.2-1) | by the build |
+
+## Tested
+
+Proxmox VE 9.2-1, `tests/vm-test.sh` on a Proxmox VE node: QEMU/KVM, UEFI (OVMF), the ISO as a USB stick, a 16 GB
+disk with a set serial, user-mode network.
+
+| # | Result | Test machine and what happened |
+|---|---|---|
+| 1 | ok | vm1 entry, serial WRONG: picker refuses, disk untouched |
+| 2 | ok | vm1 entry, wrong disk serial: installer's filter refuses, disk untouched |
+| 3 | ok | vm1 entry, wrong MAC: installer's filter refuses, disk untouched |
+| 4 | ok | vm2 entry (no serial file), wrong disk: no early check, installer's filter refuses, disk untouched |
+| 5 | ok | vm1 entry, vm1's machine: installs unattended and reboots (118 s, QEMU exit 0) |
+| 6 | ok | boots from disk: vm1.example.org, 10.0.2.15/24, pool healthy, first-boot ran, no multiprox option left |
+
+Tests 1 to 4: "disk untouched" means all 16 GB still read as zeros. Test 6 boots the installed disk with the
+stick removed and checks over SSH.
+
+Also done: the built ISO written to a real USB stick with the `dd` above, and `cmp` says it matches.
+
+**Not tested:** booting the stick on real hardware; legacy BIOS boot; Secure Boot on; products other than
+Proxmox VE.
+
+## The tests
+
+**The next commands write temporary files (and start QEMU, for the VM test).**
+
+```
+# 🔴 [!! makes changes !!] temp files only (MULTIPROX_TEST_TMP, default /var/tmp), removed at the end
+MULTIPROX_TEST_ISO=proxmox-ve_9.2-1.iso tests/build-test.sh     # the checks and the build: under a minute, 4 GB free
+MULTIPROX_TEST_ISO=proxmox-ve_9.2-1.iso tests/picker-test.sh    # the picker in the initrd's busybox: seconds
+MULTIPROX_TEST_ISO=proxmox-ve_9.2-1.iso tests/vm-test.sh        # boots test machines: about 10 min, 8 GB free
+```
+
+`picker-test.sh` runs the picker in a chroot of the stock initrd as an unprivileged user namespace (`unshare -r`):
+no root, no VM. `vm-test.sh` needs KVM, OVMF (`/usr/share/pve-edk2-firmware`, or set `MULTIPROX_OVMF_DIR`) and `sudo -n kvm`
+(passwordless sudo for QEMU). It prints a table and exits 0 only if every test passed; a failure shows the end of
+that machine's serial console.
+
+## Secrets
+
+The ISO, and so the stick, hold every answer file: root password hashes, SSH keys, addresses. Keep the stick like
+a key. Never commit a nodes folder or an ISO (`.gitignore` has `nodes/`, `out/`, `*.iso`).
+
+## Licence
+
+MIT, see [LICENSE](LICENSE).

@@ -1,0 +1,25 @@
+[global]
+keyboard = "en-us"
+country = "us"
+fqdn = "spike1.example.org"
+mailto = "root@localhost"
+timezone = "America/New_York"
+root-password-hashed = "<test hash removed>"
+root-ssh-keys = [ "<test key removed>" ]
+reboot-on-error = false
+
+[network]
+source = "from-answer"
+cidr = "10.0.2.15/24"
+dns = "10.0.2.3"
+gateway = "10.0.2.2"
+filter.ID_NET_NAME_MAC = "enx525400aabb01"
+
+[disk-setup]
+filesystem = "zfs"
+zfs.raid = "raid0"
+filter.ID_SERIAL = "SPIKEDISK01"
+
+[first-boot]
+source = "from-iso"
+ordering = "before-network"

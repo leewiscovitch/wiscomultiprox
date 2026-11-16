@@ -1,0 +1,25 @@
+#!/bin/sh
+# labx picker: started once by the installer's own /init through busybox mdev (/etc/mdev.conf, on loop0), after
+# /proc, /sys and /dev are mounted. Checks that the menu entry's node is this machine and shows that node's answer
+# file as a loop device labelled proxmox-ais. The installer's files are untouched.
+export PATH=/sbin:/bin:/usr/bin:/usr/sbin
+[ -e /labx/.ran ] && exit 0
+: > /labx/.ran
+stop() {
+    echo; echo "[labx] REFUSED: $1"
+    echo "[labx] Nothing was written to any disk. Switch the machine off (hold the power button)."
+    while :; do sleep 3600; done
+}
+node=
+for par in $(cat /proc/cmdline); do
+    case $par in proxmox-labx-node=*) node="${par#proxmox-labx-node=}" ;; esac
+done
+[ -n "$node" ] || stop "no proxmox-labx-node= on the kernel command line"
+case $node in *[!a-z0-9-]*) stop "bad node name '$node'" ;; esac
+[ -f "/labx/$node.serial" ] && [ -f "/labx/$node.img" ] || stop "this stick has no answer for '$node'"
+want=$(cat "/labx/$node.serial")
+have=$(cat /sys/class/dmi/id/product_serial)
+[ "$want" = "$have" ] || stop "this machine's serial number is '$have'; the entry is for $node ('$want')"
+dev=$(losetup -f) || stop "no free loop device"
+losetup -r "$dev" "/labx/$node.img" || stop "could not attach the answer image"
+echo "[labx] $node: serial number $have matches; its answer file is on $dev"
